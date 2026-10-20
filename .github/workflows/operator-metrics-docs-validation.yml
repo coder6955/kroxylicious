@@ -1,0 +1,167 @@
+name: Validate rebased operator SDK changes
+
+on:
+  push:
+    branches: [validation/operator-metrics-docs]
+
+permissions:
+  contents: read
+
+jobs:
+  operator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21', '25']
+    env:
+      MAVEN_OPTS: -Xmx3g -XX:+ExitOnOutOfMemoryError
+      OPERATOR: kroxylicious-kubernetes/kroxylicious-operator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 84aa4640c8777c1076cfde45c9fc8fc22fb25b29
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Install checksum-verified Maven 3.9.11
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=apache-maven-3.9.11-bin.tar.gz
+          url="https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/$archive"
+          curl --fail --location --retry 3 "$url" -o "$archive"
+          curl --fail --location --retry 3 "$url.sha512" -o "$archive.sha512"
+          digest=$(grep -Eo '[0-9a-fA-F]{128}' "$archive.sha512" | head -n 1)
+          test "${#digest}" -eq 128
+          echo "$digest  $archive" | sha512sum --check
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
+      - name: Record exact source and runtime
+        run: |
+          mkdir -p validation-evidence
+          test "$(git rev-parse HEAD)" = 84aa4640c8777c1076cfde45c9fc8fc22fb25b29
+          git show --stat --format=fuller HEAD | tee validation-evidence/source.txt
+          java -version 2>&1 | tee validation-evidence/java.txt
+          mvn -version | tee validation-evidence/maven.txt
+          echo 'MAVEN_BASE=-B -ntp -DskipDocs=true -Djapicmp.skip=true -DskipContainerImageBuild=true -DskipITs=true -DskipSTs=true -DskipKTs=true -DskipDTs=true' >> "$GITHUB_ENV"
+      - name: Install operator dependencies
+        run: |
+          set -o pipefail
+          mvn $MAVEN_BASE -P'!qa' -pl "$OPERATOR" -am -DskipTests=true -Derrorprone.skip=true install 2>&1 | tee validation-evidence/dependency-preparation.log
+      - name: Clean compile operator reactor with Error Prone enabled
+        run: |
+          set -o pipefail
+          mvn $MAVEN_BASE -pl "$OPERATOR" -am -DskipTests=true clean test-compile 2>&1 | tee validation-evidence/reactor-test-compile.log
+      - name: Verify operator and run all unit tests
+        run: |
+          set -o pipefail
+          mvn $MAVEN_BASE -pl "$OPERATOR" verify 2>&1 | tee validation-evidence/operator-verify.log
+          git diff --exit-code
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          reports = list(Path('kroxylicious-kubernetes/kroxylicious-operator/target/surefire-reports').glob('TEST-*.xml'))
+          assert reports, 'No operator unit test reports'
+          totals = {k: 0 for k in ('tests', 'failures', 'errors', 'skipped')}
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              for key in totals:
+                  totals[key] += int(suite.attrib.get(key, 0))
+          print(totals)
+          assert totals['tests'] > 0
+          assert totals['failures'] == totals['errors'] == 0, totals
+          PY
+      - name: Upload operator validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: operator-sdk-validation-java-${{ matrix.java }}
+          path: |
+            validation-evidence/
+            kroxylicious-kubernetes/kroxylicious-operator/target/surefire-reports/
+          retention-days: 14
+  documentation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: -Xmx3g -XX:+ExitOnOutOfMemoryError
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 84aa4640c8777c1076cfde45c9fc8fc22fb25b29
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Install checksum-verified Maven 3.9.11
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=apache-maven-3.9.11-bin.tar.gz
+          url="https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/$archive"
+          curl --fail --location --retry 3 "$url" -o "$archive"
+          curl --fail --location --retry 3 "$url.sha512" -o "$archive.sha512"
+          digest=$(grep -Eo '[0-9a-fA-F]{128}' "$archive.sha512" | head -n 1)
+          test "${#digest}" -eq 128
+          echo "$digest  $archive" | sha512sum --check
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
+      - name: Record exact source and runtime
+        run: |
+          mkdir -p validation-evidence
+          test "$(git rev-parse HEAD)" = 84aa4640c8777c1076cfde45c9fc8fc22fb25b29
+          git show --stat --format=fuller HEAD | tee validation-evidence/source.txt
+          java -version 2>&1 | tee validation-evidence/java.txt
+          mvn -version | tee validation-evidence/maven.txt
+      - name: Install documentation dependencies
+        run: |
+          set -o pipefail
+          mvn -B -ntp -P'dist,!qa' -pl kroxylicious-docs,kroxylicious-docs-tests -am -DskipTests=true -DskipDocs=true -Derrorprone.skip=true -Djapicmp.skip=true -DskipContainerImageBuild=true -DskipITs=true -DskipSTs=true -DskipKTs=true -DskipDTs=true install 2>&1 | tee validation-evidence/dependency-preparation.log
+      - name: Package guides and run documentation unit tests
+        run: |
+          set -o pipefail
+          mvn -B -ntp -Pdist -pl kroxylicious-docs,kroxylicious-docs-tests -DskipContainerImageBuild=true -DskipITs=true -DskipSTs=true -DskipKTs=true -DskipDTs=true -Djapicmp.skip=true package 2>&1 | tee validation-evidence/documentation-package.log
+      - name: Verify rendered migration procedure and cross-reference
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          html = Path('kroxylicious-docs/target/docs/html/kroxylicious-operator/index.html').read_text()
+          anchor = 'proc-operator-updating-metrics-operator'
+          assert f'id="{anchor}"' in html
+          assert f'href="#{anchor}"' in html
+          assert 'Updating dashboards and alerts for operator metrics' in html
+          assert 'operator_sdk_reconciliations_executions_kafkaproxyreconciler' in html
+          assert 'reconciliations_execution_duration_seconds_*' in html
+          assert 'id="con-operator-json-logging-operator"' in html
+          for folder in ('html', 'embedded', 'pdf'):
+              artifacts = list(Path('kroxylicious-docs/target/docs', folder).rglob('index.' + ('pdf' if folder == 'pdf' else 'html')))
+              print(folder, len(artifacts))
+              assert len(artifacts) >= 16, (folder, artifacts)
+          reports = list(Path('kroxylicious-docs-tests/target/surefire-reports').glob('TEST-*.xml'))
+          assert reports, 'No documentation unit test reports'
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              print(report.name, suite.attrib)
+              assert int(suite.attrib['tests']) > 0
+              assert all(int(suite.attrib.get(k, 0)) == 0 for k in ('failures', 'errors', 'skipped'))
+          PY
+          git diff --exit-code
+      - name: Upload validation evidence and operator guide
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: operator-metrics-documentation-validation
+          path: |
+            validation-evidence/
+            kroxylicious-docs-tests/target/surefire-reports/
+            kroxylicious-docs/target/docs/html/kroxylicious-operator/
+            kroxylicious-docs/target/docs/pdf/kroxylicious-operator/
+          retention-days: 14
