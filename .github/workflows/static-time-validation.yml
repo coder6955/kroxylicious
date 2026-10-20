@@ -1,0 +1,107 @@
+name: Validate static time initialization checks
+
+on:
+  push:
+    branches: [validation/static-condition-time]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21', '25']
+    env:
+      MAVEN_OPTS: -Xmx3g -XX:+ExitOnOutOfMemoryError
+      TARGETS: kroxylicious-kubernetes/kroxylicious-operator-test-support,kroxylicious-systemtests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 1785c1be524f0868d8a0ad68c1458b3643c9b0e1
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Install checksum-verified Maven 3.9.11
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=apache-maven-3.9.11-bin.tar.gz
+          url="https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/$archive"
+          curl --fail --location --retry 3 "$url" -o "$archive"
+          curl --fail --location --retry 3 "$url.sha512" -o "$archive.sha512"
+          digest=$(grep -Eo '[0-9a-fA-F]{128}' "$archive.sha512" | head -n 1)
+          test "${#digest}" -eq 128
+          echo "$digest  $archive" | sha512sum --check
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
+      - name: Record exact source and tools
+        run: |
+          mkdir -p validation-evidence
+          test "$(git rev-parse HEAD)" = 1785c1be524f0868d8a0ad68c1458b3643c9b0e1
+          git show --stat --format=fuller HEAD | tee validation-evidence/source.txt
+          java -version 2>&1 | tee validation-evidence/java.txt
+          mvn -version | tee validation-evidence/maven.txt
+          echo 'MAVEN_BASE=-B -ntp -DskipDocs=true -Djapicmp.skip=true -DskipContainerImageBuild=true -DskipITs=true -DskipSTs=true -DskipKTs=true -DskipDTs=true' >> "$GITHUB_ENV"
+      - name: Prepare reactor dependencies
+        run: |
+          set -o pipefail
+          mvn $MAVEN_BASE -P'!qa' -pl "$TARGETS" -am -DskipTests=true -Derrorprone.skip=true install 2>&1 | tee validation-evidence/dependency-preparation.log
+      - name: Verify the rule rejects both original static initializers
+        run: |
+          condition=kroxylicious-kubernetes/kroxylicious-operator-test-support/src/test/java/io/kroxylicious/testing/operator/assertj/ConditionAssertTest.java
+          collector=kroxylicious-systemtests/src/main/java/io/kroxylicious/systemtests/logs/TestLogCollector.java
+          git show "aa1b02a5f8e5bb5003f88b3160a811019cd11139:$condition" > "$condition"
+          git show "aa1b02a5f8e5bb5003f88b3160a811019cd11139:$collector" > "$collector"
+          for module in kroxylicious-kubernetes/kroxylicious-operator-test-support kroxylicious-systemtests; do
+            name=$(basename "$module")
+            set +e
+            set -o pipefail
+            mvn $MAVEN_BASE -pl "$module" -DskipTests=true clean test-compile 2>&1 | tee "validation-evidence/original-$name.log"
+            result=${PIPESTATUS[0]}
+            set -e
+            test "$result" -ne 0
+            grep -E '\[ERROR\].*\[TimeInStaticInitializer\]' "validation-evidence/original-$name.log"
+          done
+          git restore "$condition" "$collector"
+          git diff --exit-code
+      - name: Clean compile affected reactor with Error Prone enabled
+        run: |
+          set -o pipefail
+          mvn $MAVEN_BASE -pl "$TARGETS" -am -DskipTests=true clean test-compile 2>&1 | tee validation-evidence/reactor-test-compile.log
+      - name: Verify both affected modules and their unit tests
+        run: |
+          set -o pipefail
+          mvn $MAVEN_BASE -pl "$TARGETS" verify 2>&1 | tee validation-evidence/module-verify.log
+          git diff --exit-code
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          for module in ('kroxylicious-kubernetes/kroxylicious-operator-test-support', 'kroxylicious-systemtests'):
+              reports = list(Path(module, 'target/surefire-reports').glob('TEST-*.xml'))
+              assert reports, module
+              totals = {k: 0 for k in ('tests', 'failures', 'errors', 'skipped')}
+              for report in reports:
+                  suite = ET.parse(report).getroot()
+                  for key in totals:
+                      totals[key] += int(suite.attrib.get(key, 0))
+              print(module, totals)
+              assert totals['tests'] > 0, totals
+              assert all(totals[key] == 0 for key in ('failures', 'errors', 'skipped')), totals
+          PY
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: static-time-validation-java-${{ matrix.java }}
+          path: |
+            validation-evidence/
+            kroxylicious-kubernetes/kroxylicious-operator-test-support/target/surefire-reports/
+            kroxylicious-systemtests/target/surefire-reports/
+          retention-days: 14
